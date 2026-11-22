@@ -24,6 +24,11 @@ METRIC_HELP = {
     "memory_growth_mb": "MB a process grew within the duration window. Good for spotting leaks.",
     "process_started": "Fires when a process matching the target appears. Target is required.",
     "process_stopped": "Fires when no process matching the target has run for the duration. Target is required.",
+    "anomaly_system_cpu": "Learned baseline (EWMA). Threshold = how many standard deviations above normal, e.g. 4.",
+    "anomaly_system_memory": "Learned baseline (EWMA). Threshold = standard deviations above normal memory use.",
+    "anomaly_process_count": "Learned baseline (EWMA). Threshold = standard deviations above the usual process count.",
+    "anomaly_network": "Learned baseline (EWMA). Threshold = standard deviations above normal network traffic.",
+    "anomaly_disk_io": "Learned baseline (EWMA). Threshold = standard deviations above normal disk I/O.",
 }
 
 
@@ -151,7 +156,8 @@ class AlertsPage(Page):
             self.chip_agent.sub.configure(text=str(agent.error)[:40])
         else:
             self.chip_agent.value.configure(text="Running", text_color=t.GREEN)
-            self.chip_agent.sub.configure(text=f"{len(agent.rules)} rules, {agent.evaluated:,} checks")
+            self.chip_agent.sub.configure(
+                text=f"{len(agent.rules)} rules, {agent.evaluated:,} checks, {self._webhook_count()} webhooks")
 
         items = []
         for aid, ts, severity, rule, message, resolved_at, acked in db.recent_alerts():
@@ -170,6 +176,12 @@ class AlertsPage(Page):
                 "ON" if rule.enabled else "off", rule.name, rule.describe(), rule.severity,
             ), (rule.severity,) if rule.enabled else ("off",)))
         self.rules.sync(rule_items)
+
+    def _webhook_count(self) -> int:
+        hooks = self.app.webhooks
+        urls = {e.url for e in hooks.static_endpoints} if hooks else set()
+        urls |= {url for _name, url, _sev in self.app.db.load_webhooks()}
+        return len(urls) if hooks else 0
 
     # -- alerts ------------------------------------------------------------------
     def _toggle_mute(self) -> None:
@@ -198,6 +210,8 @@ class AlertsPage(Page):
         self.app.toasts.muted = False
         self.app.toasts.show(alert)
         self.app.toasts.muted = was_muted
+        if self.app.webhooks is not None:
+            self.app.webhooks.submit("test", aid)  # test alerts ignore min_severity
         self.refresh()
         self.app.refresh_alert_badge()
 

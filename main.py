@@ -3,12 +3,14 @@
 Usage:
     python main.py [--interval SECONDS] [--db PATH] [--retention HOURS] [--top N]
                    [--no-agent] [--no-sound] [--headless [--run-for SECONDS]]
+                   [--webhook URL ...] [--webhook-min-severity LEVEL]
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -33,8 +35,16 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="run collector + watchdog agent in the console, without the window")
     parser.add_argument("--run-for", type=float, default=0, metavar="SECONDS",
                         help="headless only: stop automatically after this many seconds")
+    parser.add_argument("--webhook", action="append", default=[], metavar="URL",
+                        help="POST alerts as JSON incidents to this URL (repeatable; "
+                             "also read from the SPM_WEBHOOKS environment variable, comma separated)")
+    parser.add_argument("--webhook-min-severity", choices=("info", "warning", "critical"),
+                        default=os.environ.get("SPM_WEBHOOK_MIN_SEVERITY", "warning"),
+                        help="lowest severity forwarded to --webhook URLs (default: warning)")
     args = parser.parse_args(argv)
     args.interval = max(0.5, args.interval)
+    env_hooks = [u for u in os.environ.get("SPM_WEBHOOKS", "").split(",") if u.strip()]
+    args.webhook = list(args.webhook) + env_hooks
     return args
 
 

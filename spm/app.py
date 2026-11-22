@@ -16,6 +16,7 @@ from .agent import WatchdogAgent
 from .collector import Collector
 from .database import Database
 from .notify import ToastManager
+from .webhooks import WebhookDispatcher, endpoints_from_args
 from .views.alerts import AlertsPage
 from .views.analytics import AnalyticsPage
 from .views.console import ConsolePage
@@ -49,10 +50,15 @@ class App(ctk.CTk):
         self.collector = Collector(args.db, interval=args.interval,
                                    retention_hours=args.retention, top_n=args.top)
         self.agent: WatchdogAgent | None = None
+        self.webhooks: WebhookDispatcher | None = None
         if not args.no_agent:
             self.db.resolve_open_alerts(time.time())
             self.agent = WatchdogAgent(args.db)
             self.collector.listeners.append(self.agent.submit)
+            self.webhooks = WebhookDispatcher(
+                args.db, endpoints_from_args(args.webhook, args.webhook_min_severity))
+            self.agent.listeners.append(self.webhooks.submit)
+            self.webhooks.start()
             self.agent.start()
         self.collector.start()
         self.toasts = ToastManager(self, on_open=self._open_alerts, sound=not args.no_sound)
@@ -262,6 +268,9 @@ class App(ctk.CTk):
         if self.agent is not None:
             self.agent.stop()
             self.agent.join(timeout=3)
+        if self.webhooks is not None:
+            self.webhooks.stop()
+            self.webhooks.join(timeout=5)
         self.collector.join(timeout=3)
         self.ro_db.close()
         self.db.close()

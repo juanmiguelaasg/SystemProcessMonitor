@@ -8,13 +8,14 @@
 [![SQLite](https://img.shields.io/badge/SQLite-WAL%20mode-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 [![GUI](https://img.shields.io/badge/GUI-CustomTkinter-1F6FEB?style=for-the-badge)](https://github.com/TomSchimansky/CustomTkinter)
 [![psutil](https://img.shields.io/badge/metrics-psutil-4B8BBE?style=for-the-badge)](https://github.com/giampaolo/psutil)
+[![Docker](https://img.shields.io/badge/Docker-headless%20agent-2496ED?style=for-the-badge&logo=docker&logoColor=white)](#docker)
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-0B0E14?style=flat-square)](#requirements)
 [![Version](https://img.shields.io/badge/version-1.1.0-22D3EE?style=flat-square)](#changelog)
 [![Agent](https://img.shields.io/badge/watchdog%20agent-100%25%20local-FB7185?style=flat-square)](#watchdog-agent)
 [![License](https://img.shields.io/badge/license-MIT-34D399?style=flat-square)](LICENSE)
 [![SQL](https://img.shields.io/badge/SQL-CTEs%20%C2%B7%20window%20functions%20%C2%B7%20views-A78BFA?style=flat-square)](sql/reports.sql)
-[![Tests](https://img.shields.io/badge/tests-77%20passed-34D399?style=flat-square&logo=pytest&logoColor=white)](#running-the-tests)
+[![Tests](https://img.shields.io/badge/tests-85%20passed-34D399?style=flat-square&logo=pytest&logoColor=white)](#running-the-tests)
 [![Code style](https://img.shields.io/badge/code%20style-PEP%208-FBBF24?style=flat-square)](https://peps.python.org/pep-0008/)
 
 <br>
@@ -33,6 +34,7 @@
 - [Quick start](#quick-start)
 - [Command-line options](#command-line-options)
 - [Watchdog agent](#watchdog-agent)
+- [Docker](#docker)
 - [How it works](#how-it-works)
 - [Database schema](#database-schema)
 - [Built-in SQL reports](#built-in-sql-reports)
@@ -199,6 +201,55 @@ Press Ctrl+C to stop.
 Alerts raised in headless mode land in the same database, so the desktop app shows them the next time
 you open it. To start the agent with Windows, create a Task Scheduler task that runs
 `pythonw main.py --headless` at logon.
+
+## Docker
+
+The image runs the collector and the watchdog agent in headless mode (a desktop window needs a display,
+so the GUI stays on the host). It is based on `python:3.12-slim`, installs only `psutil`, runs as an
+unprivileged user and keeps its database in the `/data` volume.
+
+### With Docker Compose
+
+```bash
+docker compose up -d --build     # build and start in the background
+docker compose logs -f           # follow the alerts
+docker compose ps                # STATUS shows (healthy) once snapshots are flowing
+docker compose down              # stop; the spm-data volume keeps the history
+```
+
+### With plain Docker
+
+```bash
+docker build -t system-process-monitor .
+docker run -d --name spm-agent --pid=host --restart unless-stopped \
+  -v spm-data:/data system-process-monitor
+
+# override the defaults (they are passed after the image name)
+docker run -d --name spm-agent --pid=host -v spm-data:/data \
+  system-process-monitor --interval 5 --retention 72
+```
+
+### Details
+
+| Topic | Behaviour |
+| --- | --- |
+| `--pid=host` | Lets the agent see the host's processes. Without it, it only sees its own container. |
+| Health check | `python -m spm.healthcheck` reports unhealthy if no snapshot was written in the last 30 s. |
+| Stopping | `docker stop` sends SIGTERM; the agent finishes the current sample, closes open alerts and exits. |
+| Logs | Alerts are printed one per line, without colour codes, so `docker logs` stays readable. |
+| Rules | Edit them with SQL: `docker exec -it spm-agent python -c "..."`, or copy the database out (below), edit it in the desktop app and copy it back. |
+
+Copy the database out to open it in the desktop app or any SQLite tool:
+
+```bash
+docker cp spm-agent:/data/monitor.db ./monitor-from-docker.db
+python main.py --db monitor-from-docker.db
+```
+
+> **Docker Desktop on Windows or macOS:** containers run inside a small Linux virtual machine, so even with
+> `--pid=host` the agent monitors **that VM**, not your Windows or macOS processes. To watch the Windows
+> machine itself, run the desktop app or `python main.py --headless` directly on the host. The container is
+> the right tool on Linux servers, where the host PID namespace is the real machine.
 
 ## How it works
 
@@ -376,8 +427,12 @@ SystemProcessMonitor/
 |-- run.bat                 One-click launcher for Windows
 |-- requirements.txt
 |-- requirements-dev.txt
+|-- requirements-agent.txt  Minimal dependencies for the Docker image
+|-- Dockerfile              Headless agent image
+|-- docker-compose.yml
+|-- .dockerignore
 |-- pytest.ini
-|-- tests/                  pytest suite (database, reports, collector, helpers)
+|-- tests/                  pytest suite (database, reports, collector, agent, docker, helpers)
 |-- sql/
 |   |-- schema.sql          Tables, indexes and views (idempotent)
 |   `-- reports.sql         Analytics reports with name/title/description headers
@@ -387,6 +442,7 @@ SystemProcessMonitor/
 |   |-- agent.py            Local watchdog agent: rule engine and alert lifecycle
 |   |-- notify.py           Desktop popups and alert sounds
 |   |-- headless.py         Console mode (--headless)
+|   |-- healthcheck.py      Health probe used by the Docker image
 |   |-- winproc.py          ctypes NtQuerySystemInformation process snapshot
 |   |-- database.py         SQLite layer: inserts, pruning, reports, safe queries
 |   |-- widgets.py          Canvas charts, core bars, cards, themed table, SQL highlighter
@@ -414,6 +470,7 @@ pytest
 | `tests/test_reports.py` | Every report runs on an empty database, and returns the expected answers on a known fixture |
 | `tests/test_collector.py` | Process enumeration, CPU accounting, the Windows fast path against psutil, the live collector thread |
 | `tests/test_agent.py` | Every rule type, durations, cooldowns, auto-resolve, rule reloads, default rule seeding, the agent thread end to end |
+| `tests/test_docker.py` | The headless path never imports Tk, the health check, `.dockerignore` and Dockerfile consistency, a full headless run |
 | `tests/test_theme.py` | Formatting helpers, colour blending, table sort order, the SQL tokenizer |
 
 The tests use temporary databases and never touch `data/monitor.db`. No window is opened.
@@ -447,6 +504,7 @@ The tests use temporary databases and never touch `data/monitor.db`. No window i
 - Desktop popups with sound for warning and critical alerts.
 - Headless console mode (`--headless`, `--run-for`).
 - New tables `alert_rules`, `alerts`, `meta` and the *Alert history* report.
+- Docker image and Compose file for running the agent headless, with a health check.
 
 ### 1.0.0
 - First release: live overview, process explorer, SQLite history, seven analytics reports,

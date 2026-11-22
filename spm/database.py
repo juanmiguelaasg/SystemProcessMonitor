@@ -114,10 +114,91 @@ class Database:
                 (time.time(), pid, name, action, result),
             )
 
+    # -- watchdog rules and alerts ---------------------------------------------
+    RULE_COLUMNS = "id, name, metric, threshold, duration_s, cooldown_s, severity, target, enabled"
+
+    def load_rules(self, enabled_only: bool = False) -> list[tuple]:
+        sql = f"SELECT {self.RULE_COLUMNS} FROM alert_rules"
+        if enabled_only:
+            sql += " WHERE enabled = 1"
+        return self.conn.execute(sql + " ORDER BY id").fetchall()
+
+    def save_rule(self, rule_id: int | None, name: str, metric: str, threshold: float,
+                  duration_s: float, cooldown_s: float, severity: str,
+                  target: str | None, enabled: bool) -> int:
+        values = (name, metric, threshold, duration_s, cooldown_s, severity, target or None, int(enabled))
+        with self.conn:
+            if rule_id is None:
+                cur = self.conn.execute(
+                    """INSERT INTO alert_rules
+                       (name, metric, threshold, duration_s, cooldown_s, severity, target, enabled)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", values)
+                return int(cur.lastrowid)
+            self.conn.execute(
+                """UPDATE alert_rules
+                   SET name = ?, metric = ?, threshold = ?, duration_s = ?, cooldown_s = ?,
+                       severity = ?, target = ?, enabled = ?
+                   WHERE id = ?""", (*values, rule_id))
+        return rule_id
+
+    def set_rule_enabled(self, rule_id: int, enabled: bool) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE alert_rules SET enabled = ? WHERE id = ?", (int(enabled), rule_id))
+
+    def delete_rule(self, rule_id: int) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM alert_rules WHERE id = ?", (rule_id,))
+
+    def insert_alert(self, ts: float, rule_id: int | None, rule_name: str, metric: str,
+                     severity: str, title: str, message: str, value: float | None,
+                     pid: int | None, process: str | None) -> int:
+        with self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO alerts
+                   (ts, rule_id, rule_name, metric, severity, title, message, value, pid, process)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (ts, rule_id, rule_name, metric, severity, title, message, value, pid, process))
+        return int(cur.lastrowid)
+
+    def resolve_alert(self, alert_id: int, ts: float) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE alerts SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL", (ts, alert_id))
+
+    def resolve_open_alerts(self, ts: float) -> None:
+        """Close alerts left open by a previous run (the agent lost its state when it stopped)."""
+        with self.conn:
+            self.conn.execute("UPDATE alerts SET resolved_at = ? WHERE resolved_at IS NULL", (ts,))
+
+    def acknowledge(self, alert_id: int | None = None) -> None:
+        with self.conn:
+            if alert_id is None:
+                self.conn.execute("UPDATE alerts SET acknowledged = 1 WHERE acknowledged = 0")
+            else:
+                self.conn.execute("UPDATE alerts SET acknowledged = 1 WHERE id = ?", (alert_id,))
+
+    def recent_alerts(self, limit: int = 300) -> list[tuple]:
+        return self.conn.execute(
+            """SELECT id, ts, severity, rule_name, message, resolved_at, acknowledged
+               FROM alerts ORDER BY ts DESC, id DESC LIMIT ?""", (limit,)).fetchall()
+
+    def alert_counts(self) -> dict[str, int]:
+        row = self.conn.execute(
+            """SELECT COALESCE(SUM(resolved_at IS NULL), 0),
+                      COALESCE(SUM(acknowledged = 0), 0),
+                      COALESCE(SUM(ts >= ?), 0),
+                      COALESCE(SUM(severity = 'critical' AND acknowledged = 0), 0)
+               FROM alerts""", (time.time() - 86400,)).fetchone()
+        return {"open": row[0], "unacknowledged": row[1], "last_24h": row[2], "critical": row[3]}
+
+    # -- maintenance -----------------------------------------------------------
     def prune(self, retention_hours: float) -> int:
         """Delete history older than the retention window. Returns removed snapshots."""
         cutoff = time.time() - retention_hours * 3600
         with self.conn:
+            # alerts are tiny, keep them for 30 days or the retention window, whichever is longer
+            self.conn.execute("DELETE FROM alerts WHERE ts < ?",
+                              (min(cutoff, time.time() - 30 * 86400),))
             self.conn.execute("DELETE FROM process_samples WHERE ts < ?", (cutoff,))
             cur = self.conn.execute("DELETE FROM system_snapshots WHERE ts < ?", (cutoff,))
             self.conn.execute(

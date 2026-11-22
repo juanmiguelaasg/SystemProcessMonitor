@@ -191,6 +191,55 @@ class Database:
                FROM alerts""", (time.time() - 86400,)).fetchone()
         return {"open": row[0], "unacknowledged": row[1], "last_24h": row[2], "critical": row[3]}
 
+    def get_alert(self, alert_id: int) -> dict | None:
+        cur = self.conn.execute(
+            """SELECT id, ts, rule_id, rule_name, metric, severity, title, message, value,
+                      pid, process, resolved_at, acknowledged
+               FROM alerts WHERE id = ?""", (alert_id,))
+        row = cur.fetchone()
+        return dict(zip([d[0] for d in cur.description], row)) if row else None
+
+    # -- baselines -------------------------------------------------------------
+    def load_baselines(self) -> dict[str, tuple[float, float, int, float]]:
+        return {row[0]: tuple(row[1:]) for row in self.conn.execute(
+            "SELECT series, mean, var, samples, updated_at FROM baselines")}
+
+    def save_baselines(self, rows: Iterable[tuple]) -> None:
+        """rows: (series, mean, var, std, samples, updated_at)."""
+        with self.conn:
+            self.conn.executemany(
+                """INSERT INTO baselines (series, mean, var, std, samples, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(series) DO UPDATE SET
+                       mean = excluded.mean, var = excluded.var, std = excluded.std,
+                       samples = excluded.samples, updated_at = excluded.updated_at""",
+                list(rows))
+
+    # -- webhooks --------------------------------------------------------------
+    def load_webhooks(self, enabled_only: bool = True) -> list[tuple[str, str, str]]:
+        """[(name, url, min_severity), ...]"""
+        sql = "SELECT name, url, min_severity FROM webhook_endpoints"
+        if enabled_only:
+            sql += " WHERE enabled = 1"
+        return self.conn.execute(sql + " ORDER BY id").fetchall()
+
+    def add_webhook(self, name: str, url: str, min_severity: str = "warning") -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO webhook_endpoints (name, url, min_severity) VALUES (?, ?, ?)
+                   ON CONFLICT(url) DO UPDATE SET name = excluded.name,
+                       min_severity = excluded.min_severity, enabled = 1""",
+                (name, url, min_severity))
+
+    def log_delivery(self, alert_id: int | None, endpoint: str, event: str, ok: bool,
+                     status_code: int | None, attempts: int, error: str | None) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO webhook_deliveries
+                   (ts, alert_id, endpoint, event, ok, status_code, attempts, error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (time.time(), alert_id, endpoint, event, int(ok), status_code, attempts, error))
+
     # -- maintenance -----------------------------------------------------------
     def prune(self, retention_hours: float) -> int:
         """Delete history older than the retention window. Returns removed snapshots."""

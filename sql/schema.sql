@@ -152,3 +152,57 @@ FROM (
 WHERE NOT EXISTS (SELECT 1 FROM meta WHERE key = 'default_rules_seeded');
 
 INSERT OR IGNORE INTO meta (key, value) VALUES ('default_rules_seeded', '1');
+
+-- ============================================================================
+--  Anomaly detection and webhooks
+-- ============================================================================
+
+-- Learned EWMA baseline per series, so a restart does not start from zero.
+CREATE TABLE IF NOT EXISTS baselines (
+    series      TEXT    PRIMARY KEY,             -- e.g. 'system_cpu', 'network'
+    mean        REAL    NOT NULL,
+    var         REAL    NOT NULL,
+    std         REAL    NOT NULL,                -- effective spread used for z-scores
+    samples     INTEGER NOT NULL,
+    updated_at  REAL    NOT NULL
+);
+
+-- Where alerts are forwarded. Extra endpoints can also come from --webhook / SPM_WEBHOOKS.
+CREATE TABLE IF NOT EXISTS webhook_endpoints (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT    NOT NULL,
+    url           TEXT    NOT NULL UNIQUE,
+    min_severity  TEXT    NOT NULL DEFAULT 'warning'
+                  CHECK (min_severity IN ('info', 'warning', 'critical')),
+    enabled       INTEGER NOT NULL DEFAULT 1
+);
+
+-- One row per delivery attempt sequence (after retries).
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           REAL    NOT NULL,
+    alert_id     INTEGER,
+    endpoint     TEXT    NOT NULL,
+    event        TEXT    NOT NULL,               -- alert.fired / alert.resolved / alert.test
+    ok           INTEGER NOT NULL,
+    status_code  INTEGER,
+    attempts     INTEGER NOT NULL,
+    error        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_ts ON webhook_deliveries(ts);
+
+-- Anomaly rules, inserted once per database (also for databases created by 1.1.0).
+INSERT INTO alert_rules (name, metric, threshold, duration_s, cooldown_s, severity, target, enabled)
+SELECT d.name, d.metric, d.threshold, d.duration_s, d.cooldown_s, d.severity, NULL, d.enabled
+FROM (
+              SELECT 'Unusual CPU load'        AS name, 'anomaly_system_cpu'    AS metric, 4 AS threshold, 20 AS duration_s,  900 AS cooldown_s, 'warning' AS severity, 1 AS enabled
+    UNION ALL SELECT 'Unusual memory jump',            'anomaly_system_memory',            4,              30,              1800,              'warning',             1
+    UNION ALL SELECT 'Process count surge',            'anomaly_process_count',            5,              10,              1800,              'info',                1
+    UNION ALL SELECT 'Unusual network traffic',        'anomaly_network',                  5,              10,               900,              'info',                0
+    UNION ALL SELECT 'Unusual disk activity',          'anomaly_disk_io',                  5,              30,               900,              'info',                0
+) AS d
+WHERE NOT EXISTS (SELECT 1 FROM meta WHERE key = 'anomaly_rules_seeded')
+  AND NOT EXISTS (SELECT 1 FROM alert_rules AS r WHERE r.name = d.name);
+
+INSERT OR IGNORE INTO meta (key, value) VALUES ('anomaly_rules_seeded', '1');

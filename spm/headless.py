@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import queue
 import signal
+import sys
 import time
 from datetime import datetime
 
@@ -36,7 +37,7 @@ def run_headless(args) -> int:
 
     print(f"Watchdog agent running locally: {len(rules)} enabled rules, sampling every {args.interval:g}s.")
     print(f"Database: {args.db}")
-    print("Press Ctrl+C to stop.\n")
+    print(f"Running for {args.run_for:g}s.\n" if args.run_for else "Press Ctrl+C to stop.\n")
 
     stopping = False
 
@@ -44,8 +45,9 @@ def run_headless(args) -> int:
         nonlocal stopping
         stopping = True
 
-    signal.signal(signal.SIGINT, _stop)
-    deadline = time.monotonic() + args.run_for if getattr(args, "run_for", 0) else None
+    previous = {sig: signal.signal(sig, _stop) for sig in (signal.SIGINT, signal.SIGTERM)}  # SIGTERM = docker stop
+    use_color = sys.stdout.isatty()
+    deadline = time.monotonic() + args.run_for if args.run_for else None
     try:
         while not stopping:
             if deadline is not None and time.monotonic() >= deadline:
@@ -58,12 +60,20 @@ def run_headless(args) -> int:
                     break
                 continue
             stamp = datetime.fromtimestamp(alert.ts).strftime("%Y-%m-%d %H:%M:%S")
-            color = COLORS.get(alert.severity, "")
-            print(f"{stamp}  {color}{alert.severity.upper():8}{RESET}  {alert.title}: {alert.message}", flush=True)
+            color, reset = (COLORS.get(alert.severity, ""), RESET) if use_color else ("", "")
+            print(f"{stamp}  {color}{alert.severity.upper():8}{reset}  {alert.title}: {alert.message}", flush=True)
     finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
         collector.stop()
         agent.stop()
         collector.join(timeout=3)
         agent.join(timeout=3)
+        try:
+            closing = Database(args.db)
+            closing.resolve_open_alerts(time.time())
+            closing.close()
+        except Exception:
+            pass
         print(f"\nStopped after {collector.samples_written} samples.")
     return 1 if (collector.error or agent.error) else 0

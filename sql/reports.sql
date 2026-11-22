@@ -159,3 +159,33 @@ FROM alerts
 WHERE ts >= :since
 GROUP BY rule_name, severity
 ORDER BY fired DESC;
+
+-- name: baselines
+-- title: Learned baselines
+-- description: What the agent currently considers normal for each series (EWMA mean and spread). Ignores the time range.
+SELECT
+    series,
+    ROUND(mean, 2)                        AS normal_level,
+    ROUND(std, 2)                         AS std_dev,
+    ROUND(mean + 4 * std, 2)              AS z4_level,
+    samples,
+    datetime(updated_at, 'unixepoch', 'localtime') AS updated
+FROM baselines
+ORDER BY series;
+
+-- name: webhook_deliveries
+-- title: Webhook deliveries
+-- description: Incidents forwarded to webhook endpoints, with success rate, retries and the last error per endpoint.
+SELECT
+    endpoint,
+    event,
+    COUNT(*)                              AS deliveries,
+    SUM(ok)                               AS succeeded,
+    ROUND(100.0 * SUM(ok) / COUNT(*), 1)  AS success_pct,
+    ROUND(AVG(attempts), 2)               AS avg_attempts,
+    MAX(CASE WHEN ok = 0 THEN error END)  AS last_error,
+    datetime(MAX(ts), 'unixepoch', 'localtime') AS last_delivery
+FROM webhook_deliveries
+WHERE ts >= :since
+GROUP BY endpoint, event
+ORDER BY last_delivery DESC;

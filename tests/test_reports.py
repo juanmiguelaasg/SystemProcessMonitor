@@ -12,7 +12,8 @@ REPORTS = load_reports()
 def test_reports_parsed():
     names = [r.name for r in REPORTS]
     assert names == ["top_cpu", "top_memory", "load_per_minute", "cpu_spikes",
-                     "memory_growth", "sessions", "events", "alert_history"]
+                     "memory_growth", "sessions", "events", "alert_history",
+                     "baselines", "webhook_deliveries"]
     for r in REPORTS:
         assert r.title and r.description
         assert r.sql.lstrip().upper().startswith(("SELECT", "WITH"))

@@ -2,7 +2,7 @@
 
 # System Process Monitor
 
-**A modern desktop process monitor that records everything it sees into SQLite, then lets you interrogate that history with real SQL.**
+**A modern desktop process monitor with a local watchdog agent. It records everything it sees into SQLite, raises alerts when something looks wrong, and lets you interrogate the history with real SQL.**
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![SQLite](https://img.shields.io/badge/SQLite-WAL%20mode-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](https://www.sqlite.org/)
@@ -10,10 +10,11 @@
 [![psutil](https://img.shields.io/badge/metrics-psutil-4B8BBE?style=for-the-badge)](https://github.com/giampaolo/psutil)
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-0B0E14?style=flat-square)](#requirements)
-[![Version](https://img.shields.io/badge/version-1.0.0-22D3EE?style=flat-square)](#changelog)
+[![Version](https://img.shields.io/badge/version-1.1.0-22D3EE?style=flat-square)](#changelog)
+[![Agent](https://img.shields.io/badge/watchdog%20agent-100%25%20local-FB7185?style=flat-square)](#watchdog-agent)
 [![License](https://img.shields.io/badge/license-MIT-34D399?style=flat-square)](LICENSE)
 [![SQL](https://img.shields.io/badge/SQL-CTEs%20%C2%B7%20window%20functions%20%C2%B7%20views-A78BFA?style=flat-square)](sql/reports.sql)
-[![Tests](https://img.shields.io/badge/tests-56%20passed-34D399?style=flat-square&logo=pytest&logoColor=white)](#running-the-tests)
+[![Tests](https://img.shields.io/badge/tests-77%20passed-34D399?style=flat-square&logo=pytest&logoColor=white)](#running-the-tests)
 [![Code style](https://img.shields.io/badge/code%20style-PEP%208-FBBF24?style=flat-square)](https://peps.python.org/pep-0008/)
 
 <br>
@@ -31,6 +32,7 @@
 - [Screenshots](#screenshots)
 - [Quick start](#quick-start)
 - [Command-line options](#command-line-options)
+- [Watchdog agent](#watchdog-agent)
 - [How it works](#how-it-works)
 - [Database schema](#database-schema)
 - [Built-in SQL reports](#built-in-sql-reports)
@@ -61,7 +63,8 @@ full SQL console to answer those questions yourself.
 | **Live overview** | CPU, memory, disk I/O and network cards with sparklines, a 4-minute utilisation chart, per-core load bars, busiest processes and system facts. |
 | **Process explorer** | Every running process with PID, user, CPU, memory, threads and start time. Click-to-sort columns, instant filter, a freeze switch and **End task** (with confirmation and an audit trail). |
 | **Persistent history** | Machine-wide snapshots plus the heaviest processes per tick are written to SQLite in WAL mode, with automatic retention pruning. |
-| **Analytics** | Seven pre-built reports (top CPU, memory heavyweights, per-minute load, CPU spikes with culprits, memory growth, sessions, audit log) over a selectable time window. |
+| **Watchdog agent** | A local agent evaluates rules on every sample (CPU, memory, disk, per-process load, memory leaks, processes starting or stopping), keeps alerts open until the condition clears, and notifies you with desktop popups and a sound. Runs inside the app or on its own with `--headless`. |
+| **Analytics** | Eight pre-built reports (top CPU, memory heavyweights, per-minute load, CPU spikes with culprits, memory growth, sessions, audit log, alert history) over a selectable time window. |
 | **SQL console** | Syntax-highlighted editor, schema browser, example library, CSV export. The connection is opened **read-only**, and runaway queries are cancelled after 8 seconds. |
 | **Fast on Windows** | Process data comes from a single `NtQuerySystemInformation` call, the same source Task Manager uses, instead of opening every process one by one. |
 | **Restart friendly** | The dashboard charts are pre-filled from the database, so restarting the app does not leave you staring at empty graphs. |
@@ -75,7 +78,7 @@ full SQL console to answer those questions yourself.
   </tr>
   <tr>
     <td width="50%"><img src="docs/screenshots/console.png" alt="SQL console"><p align="center"><sub><b>SQL Console</b>: read-only, highlighted, exportable</sub></p></td>
-    <td width="50%"><img src="docs/screenshots/dashboard.png" alt="Overview dashboard"><p align="center"><sub><b>Overview</b>: live health at a glance</sub></p></td>
+    <td width="50%"><img src="docs/screenshots/alerts.png" alt="Alerts"><p align="center"><sub><b>Alerts</b>: feed, rules and agent status</sub></p></td>
   </tr>
 </table>
 
@@ -110,6 +113,7 @@ The database is created on first run at `data/monitor.db`.
 
 ```text
 python main.py [--interval SECONDS] [--db PATH] [--retention HOURS] [--top N]
+               [--no-agent] [--no-sound] [--headless [--run-for SECONDS]]
 ```
 
 | Option | Default | Description |
@@ -118,12 +122,83 @@ python main.py [--interval SECONDS] [--db PATH] [--retention HOURS] [--top N]
 | `--db` | `data/monitor.db` | Location of the SQLite database file. |
 | `--retention` | `24` | Hours of history to keep. Older rows are pruned at startup and every 300 ticks. |
 | `--top` | `40` | Processes persisted per snapshot: the top N by CPU, merged with the top N by memory. |
+| `--no-agent` | off | Do not start the watchdog agent. |
+| `--no-sound` | off | Show alert popups silently. |
+| `--headless` | off | Run the collector and the agent in the console, without a window. |
+| `--run-for` | `0` | With `--headless`: exit after this many seconds (0 = until Ctrl+C). |
 
 Example: sample every second and keep a full week of data.
 
 ```bash
 python main.py --interval 1 --retention 168
 ```
+
+## Watchdog agent
+
+The agent is a plain Python thread that lives on your machine. It does not call any network service,
+API or language model: it reads the samples the collector produces, checks them against the rules in
+the `alert_rules` table and writes what it finds to the `alerts` table.
+
+<div align="center">
+<img src="docs/screenshots/rule-editor.png" alt="Rule editor" width="380">
+</div>
+
+### How a rule behaves
+
+| Field | Meaning |
+| --- | --- |
+| `metric` | What to measure (see the table below). |
+| `threshold` | The rule matches when the value is **greater than or equal** to this. |
+| `duration_s` | How long the condition must hold before an alert fires. For `memory_growth_mb` it is the observation window. |
+| `cooldown_s` | Minimum time between two alerts of the same rule and target. |
+| `severity` | `info`, `warning` or `critical`. Warning and critical alerts also play a system sound. |
+| `target` | Optional case-insensitive glob on the process name, for example `chrome*.exe`. |
+
+An alert stays **open** while the condition is true and is **resolved** automatically when it clears
+(or when the process exits). Acknowledging an alert only marks it as seen.
+
+| Metric | Scope | Example |
+| --- | --- | --- |
+| `system_cpu` | machine | Total CPU at or above 90 % for 30 s |
+| `system_memory` | machine | RAM usage at or above 95 % for 60 s |
+| `swap` | machine | Page file at or above 80 % |
+| `disk_usage` | machine | System drive at or above 90 % full |
+| `process_count` | machine | More than 600 processes |
+| `process_cpu` | per process | Any process above 50 % CPU for a minute |
+| `process_memory_mb` | per process | A process using more than 4 GB |
+| `memory_growth_mb` | per process | A process that grew by 500 MB in 10 minutes |
+| `process_started` | watch | `Taskmgr.exe` was opened |
+| `process_stopped` | watch | No `explorer.exe` has been running for 5 s |
+
+Ten rules are seeded the first time a database is created (two of them disabled, as examples).
+Edit them on the **Alerts** page, or straight in SQL:
+
+```sql
+UPDATE alert_rules SET threshold = 80, duration_s = 20 WHERE name = 'High CPU load';
+
+INSERT INTO alert_rules (name, metric, threshold, duration_s, cooldown_s, severity, target)
+VALUES ('Chrome too hungry', 'process_memory_mb', 2048, 30, 600, 'warning', 'chrome.exe');
+```
+
+Changes made on the Alerts page apply immediately; changes made from outside apply the next time the app starts.
+
+### Running only the agent
+
+```bash
+python main.py --headless
+```
+
+```text
+Watchdog agent running locally: 8 enabled rules, sampling every 2s.
+Database: data/monitor.db
+Press Ctrl+C to stop.
+
+2026-11-22 23:14:33  WARNING   Runaway process: game.exe (PID 4120): process cpu at 63.0% (limit 50%) for 60s
+```
+
+Alerts raised in headless mode land in the same database, so the desktop app shows them the next time
+you open it. To start the agent with Windows, create a Task Scheduler task that runs
+`pythonw main.py --headless` at logon.
 
 ## How it works
 
@@ -133,9 +208,13 @@ flowchart LR
         A[NtQuerySystemInformation<br/>or psutil] --> B[Sample]
         B --> C[(SQLite<br/>WAL mode)]
     end
+    B -- every sample --> W[Watchdog agent<br/>thread]
+    W -- alerts --> C
+    W -- new alerts --> D
     B -- latest sample --> D[Tk main loop<br/>polls every 250 ms]
     D --> E[Overview]
     D --> F[Processes]
+    D --> P[Alerts page<br/>and popups]
     C -- read-only connection --> G[Analytics]
     C -- read-only connection --> H[SQL Console]
 ```
@@ -154,6 +233,7 @@ flowchart LR
 erDiagram
     sessions ||--o{ system_snapshots : records
     system_snapshots ||--o{ process_samples : contains
+    alert_rules ||--o{ alerts : raises
     sessions {
         INTEGER id PK
         REAL started_at
@@ -183,6 +263,27 @@ erDiagram
         REAL cpu_percent
         INTEGER mem_rss
         INTEGER threads
+    }
+    alert_rules {
+        INTEGER id PK
+        TEXT name
+        TEXT metric
+        REAL threshold
+        REAL duration_s
+        REAL cooldown_s
+        TEXT severity
+        TEXT target
+        INTEGER enabled
+    }
+    alerts {
+        INTEGER id PK
+        REAL ts
+        INTEGER rule_id FK
+        TEXT severity
+        TEXT message
+        INTEGER pid
+        REAL resolved_at
+        INTEGER acknowledged
     }
     process_events {
         INTEGER id PK
@@ -218,6 +319,7 @@ All reports live in [`sql/reports.sql`](sql/reports.sql) and are parsed at start
 | Memory growth | Two CTEs plus a self-join of first and last samples to find leaks |
 | Recording sessions | `LEFT JOIN` aggregate over every run of the app |
 | Action audit log | Every **End task** attempt and its outcome |
+| Alert history | Conditional aggregates such as `SUM(resolved_at IS NULL)` and mean time to resolve per rule |
 
 Here is the spike report, which pairs every CPU spike with the process responsible for it:
 
@@ -282,6 +384,9 @@ SystemProcessMonitor/
 |-- spm/
 |   |-- app.py              Main window, sidebar, page routing, polling loop
 |   |-- collector.py        Background sampler thread
+|   |-- agent.py            Local watchdog agent: rule engine and alert lifecycle
+|   |-- notify.py           Desktop popups and alert sounds
+|   |-- headless.py         Console mode (--headless)
 |   |-- winproc.py          ctypes NtQuerySystemInformation process snapshot
 |   |-- database.py         SQLite layer: inserts, pruning, reports, safe queries
 |   |-- widgets.py          Canvas charts, core bars, cards, themed table, SQL highlighter
@@ -290,7 +395,8 @@ SystemProcessMonitor/
 |       |-- dashboard.py
 |       |-- processes.py
 |       |-- analytics.py
-|       `-- console.py
+|       |-- console.py
+|       `-- alerts.py
 |-- docs/screenshots/
 `-- data/                   Created at runtime (monitor.db)
 ```
@@ -307,6 +413,7 @@ pytest
 | `tests/test_database.py` | Schema bootstrap, WAL mode, inserts, retention pruning, read-only enforcement, row limits, query timeout |
 | `tests/test_reports.py` | Every report runs on an empty database, and returns the expected answers on a known fixture |
 | `tests/test_collector.py` | Process enumeration, CPU accounting, the Windows fast path against psutil, the live collector thread |
+| `tests/test_agent.py` | Every rule type, durations, cooldowns, auto-resolve, rule reloads, default rule seeding, the agent thread end to end |
 | `tests/test_theme.py` | Formatting helpers, colour blending, table sort order, the SQL tokenizer |
 
 The tests use temporary databases and never touch `data/monitor.db`. No window is opened.
@@ -329,9 +436,17 @@ The tests use temporary databases and never touch `data/monitor.db`. No window i
 | `ModuleNotFoundError: customtkinter` or `psutil` | Run `pip install -r requirements.txt` with the same interpreter you use to start the app. |
 | **End task** says "access denied" | System and service processes need elevated rights. Start the terminal or `run.bat` as administrator. |
 | Text looks blurry on a high-DPI screen | Make sure you are using the regular `python.exe`, not a compatibility-mode shortcut. CustomTkinter enables per-monitor DPI awareness automatically. |
+| Too many popups | Raise the threshold or cooldown of the noisy rule on the **Alerts** page, switch on *Mute popups*, or start with `--no-sound`. |
 | "database is locked" | Two instances share one database file. Close one of them or start the second with `--db other.db`. |
 
 ## Changelog
+
+### 1.1.0
+- Local watchdog agent with ten metrics, open/resolved alert lifecycle and cooldowns.
+- Alerts page: feed, acknowledgements, rule editor, test alert, mute switch, sidebar badge.
+- Desktop popups with sound for warning and critical alerts.
+- Headless console mode (`--headless`, `--run-for`).
+- New tables `alert_rules`, `alerts`, `meta` and the *Alert history* report.
 
 ### 1.0.0
 - First release: live overview, process explorer, SQLite history, seven analytics reports,

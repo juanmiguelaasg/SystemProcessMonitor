@@ -2,6 +2,7 @@
 
 Usage:
     python main.py [--interval SECONDS] [--db PATH] [--retention HOURS] [--top N]
+                   [--no-agent] [--no-sound] [--headless [--run-for SECONDS]]
 """
 
 from __future__ import annotations
@@ -24,6 +25,14 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="hours of history to keep (default: 24)")
     parser.add_argument("--top", type=int, default=40,
                         help="processes stored per snapshot, by CPU and by memory (default: 40)")
+    parser.add_argument("--no-agent", action="store_true",
+                        help="disable the local watchdog agent (no rules, no alerts)")
+    parser.add_argument("--no-sound", action="store_true",
+                        help="do not play a sound when an alert pops up")
+    parser.add_argument("--headless", action="store_true",
+                        help="run collector + watchdog agent in the console, without the window")
+    parser.add_argument("--run-for", type=float, default=0, metavar="SECONDS",
+                        help="headless only: stop automatically after this many seconds")
     args = parser.parse_args(argv)
     args.interval = max(0.5, args.interval)
     return args
@@ -32,6 +41,9 @@ def parse_args(argv=None) -> argparse.Namespace:
 def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = parse_args(argv)
+    if args.headless:
+        from spm.headless import run_headless
+        return run_headless(args)
     try:
         from spm.app import App
     except ImportError as exc:

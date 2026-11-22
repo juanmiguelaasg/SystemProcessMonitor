@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import queue
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -10,8 +12,11 @@ import customtkinter as ctk
 from . import __version__
 from . import theme as t
 from . import widgets as w
+from .agent import WatchdogAgent
 from .collector import Collector
 from .database import Database
+from .notify import ToastManager
+from .views.alerts import AlertsPage
 from .views.analytics import AnalyticsPage
 from .views.console import ConsolePage
 from .views.dashboard import DashboardPage
@@ -22,6 +27,7 @@ NAV = [
     ("processes", "Processes", ProcessesPage),
     ("analytics", "Analytics", AnalyticsPage),
     ("console", "SQL Console", ConsolePage),
+    ("alerts", "Alerts", AlertsPage),
 ]
 
 
@@ -42,7 +48,14 @@ class App(ctk.CTk):
         self.ro_db = Database(args.db, readonly=True)
         self.collector = Collector(args.db, interval=args.interval,
                                    retention_hours=args.retention, top_n=args.top)
+        self.agent: WatchdogAgent | None = None
+        if not args.no_agent:
+            self.db.resolve_open_alerts(time.time())
+            self.agent = WatchdogAgent(args.db)
+            self.collector.listeners.append(self.agent.submit)
+            self.agent.start()
         self.collector.start()
+        self.toasts = ToastManager(self, on_open=self._open_alerts, sound=not args.no_sound)
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -63,6 +76,7 @@ class App(ctk.CTk):
         self._last_ts = 0.0
         self._pulse = False
         self._toast_job = None
+        self.refresh_alert_badge()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(250, self._poll)
         self.after(1000, self._update_status)
@@ -130,6 +144,9 @@ class App(ctk.CTk):
                                 text_color=t.MUTED, command=lambda k=key: self.show(k))
             btn.pack(fill="x", pady=2)
             self.nav_buttons[key] = btn
+        self.alert_badge = ctk.CTkLabel(self.nav_buttons["alerts"], text="", font=w.FONTS.caption,
+                                        fg_color=t.ROSE, text_color="#0b0e14", corner_radius=9,
+                                        width=24, height=20)
 
         # status block
         status = ctk.CTkFrame(bar, fg_color=t.CARD, corner_radius=12, border_width=1,
@@ -179,6 +196,18 @@ class App(ctk.CTk):
                     page.on_sample(sample)
                 except Exception as exc:  # keep the loop alive whatever happens
                     self.toast(f"UI error: {exc}")
+        if self.agent is not None:
+            new_alerts = []
+            while True:
+                try:
+                    new_alerts.append(self.agent.outbox.get_nowait())
+                except queue.Empty:
+                    break
+            for alert in new_alerts[-6:]:
+                self.toasts.show(alert)
+            if new_alerts:
+                self.pages["alerts"].on_alert(new_alerts[-1])
+                self.refresh_alert_badge()
         self.after(250, self._poll)
 
     def _update_status(self) -> None:
@@ -195,13 +224,44 @@ class App(ctk.CTk):
                     f"Every {self.args.interval:g}s  /  keep {self.args.retention:g}h\n"
                     f"{stats['snapshots']:,} snapshots\n"
                     f"{stats['samples']:,} process rows\n"
-                    f"{t.fmt_bytes(self.db.file_size())} on disk"))
+                    f"{t.fmt_bytes(self.db.file_size())} on disk\n"
+                    f"{self._agent_line()}"))
             except Exception:
                 pass
+        if int(time.time()) % 5 == 0:
+            self.refresh_alert_badge()
         self.after(1000, self._update_status)
+
+    def _agent_line(self) -> str:
+        if self.agent is None:
+            return "Agent off"
+        if self.agent.error:
+            return "Agent error"
+        return f"Agent: {len(self.agent.rules)} rules, {self.agent.open_alerts} open"
+
+
+    def refresh_alert_badge(self) -> None:
+        try:
+            count = self.db.alert_counts()["unacknowledged"]
+        except Exception:
+            return
+        if count:
+            self.alert_badge.configure(text=str(count) if count < 100 else "99+")
+            self.alert_badge.place(relx=1.0, rely=0.5, x=-10, anchor="e")
+        else:
+            self.alert_badge.place_forget()
+
+    def _open_alerts(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        self.show("alerts")
 
     def _on_close(self) -> None:
         self.collector.stop()
+        if self.agent is not None:
+            self.agent.stop()
+            self.agent.join(timeout=3)
         self.collector.join(timeout=3)
         self.ro_db.close()
         self.db.close()

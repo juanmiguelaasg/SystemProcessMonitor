@@ -330,12 +330,14 @@ class DataTable(ctk.CTkFrame):
             self.tree.insert("", "end", values=values, tags=("odd" if i % 2 else "even",))
 
     # -- incremental -----------------------------------------------------------
-    def sync(self, items: Sequence[tuple[str, tuple]]) -> None:
+    def sync(self, items: Sequence[tuple]) -> None:
+        """items: (iid, values) or (iid, values, extra_tags)."""
         tree = self.tree
         existing = set(tree.get_children())
         wanted = []
-        for idx, (iid, values) in enumerate(items):
-            tag = ("odd" if idx % 2 else "even",)
+        for idx, item in enumerate(items):
+            iid, values = item[0], item[1]
+            tag = ("odd" if idx % 2 else "even", *(item[2] if len(item) > 2 else ()))
             if iid in existing:
                 tree.item(iid, values=values, tags=tag)
             else:

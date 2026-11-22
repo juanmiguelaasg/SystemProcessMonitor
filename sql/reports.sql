@@ -142,3 +142,20 @@ SELECT
 FROM process_events
 WHERE ts >= :since
 ORDER BY ts DESC;
+
+-- name: alert_history
+-- title: Alert history
+-- description: How often each watchdog rule fired, how long its alerts stayed open and how many still need attention.
+SELECT
+    rule_name                             AS rule,
+    severity,
+    COUNT(*)                              AS fired,
+    SUM(resolved_at IS NULL)              AS still_open,
+    SUM(acknowledged = 0)                 AS unacknowledged,
+    ROUND(AVG(resolved_at - ts), 1)       AS avg_open_s,
+    COUNT(DISTINCT process)               AS processes,
+    datetime(MAX(ts), 'unixepoch', 'localtime') AS last_fired
+FROM alerts
+WHERE ts >= :since
+GROUP BY rule_name, severity
+ORDER BY fired DESC;

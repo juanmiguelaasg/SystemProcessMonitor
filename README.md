@@ -2,7 +2,7 @@
 
 # System Process Monitor
 
-**A modern desktop process monitor with a local watchdog agent. It records everything it sees into SQLite, raises alerts when something looks wrong, and lets you interrogate the history with real SQL.**
+**A modern desktop process monitor with a local watchdog agent. It records everything it sees into SQLite, learns what normal looks like, raises alerts when something deviates, forwards them as incidents over webhooks, and lets you interrogate the history with real SQL.**
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![SQLite](https://img.shields.io/badge/SQLite-WAL%20mode-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](https://www.sqlite.org/)
@@ -11,11 +11,13 @@
 [![Docker](https://img.shields.io/badge/Docker-headless%20agent-2496ED?style=for-the-badge&logo=docker&logoColor=white)](#docker)
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-0B0E14?style=flat-square)](#requirements)
-[![Version](https://img.shields.io/badge/version-1.1.0-22D3EE?style=flat-square)](#changelog)
+[![Version](https://img.shields.io/badge/version-1.2.0-22D3EE?style=flat-square)](#changelog)
 [![Agent](https://img.shields.io/badge/watchdog%20agent-100%25%20local-FB7185?style=flat-square)](#watchdog-agent)
+[![Anomaly detection](https://img.shields.io/badge/anomaly%20detection-EWMA%20%2B%20z--score-F59E0B?style=flat-square)](#anomaly-detection)
+[![Webhooks](https://img.shields.io/badge/webhooks-JSON%20incidents-0EA5E9?style=flat-square)](#webhooks)
 [![License](https://img.shields.io/badge/license-MIT-34D399?style=flat-square)](LICENSE)
 [![SQL](https://img.shields.io/badge/SQL-CTEs%20%C2%B7%20window%20functions%20%C2%B7%20views-A78BFA?style=flat-square)](sql/reports.sql)
-[![Tests](https://img.shields.io/badge/tests-85%20passed-34D399?style=flat-square&logo=pytest&logoColor=white)](#running-the-tests)
+[![Tests](https://img.shields.io/badge/tests-120%20passed-34D399?style=flat-square&logo=pytest&logoColor=white)](#running-the-tests)
 [![Code style](https://img.shields.io/badge/code%20style-PEP%208-FBBF24?style=flat-square)](https://peps.python.org/pep-0008/)
 
 <br>
@@ -34,6 +36,8 @@
 - [Quick start](#quick-start)
 - [Command-line options](#command-line-options)
 - [Watchdog agent](#watchdog-agent)
+  - [Anomaly detection](#anomaly-detection)
+  - [Webhooks](#webhooks)
 - [Docker](#docker)
 - [How it works](#how-it-works)
 - [Database schema](#database-schema)
@@ -66,7 +70,9 @@ full SQL console to answer those questions yourself.
 | **Process explorer** | Every running process with PID, user, CPU, memory, threads and start time. Click-to-sort columns, instant filter, a freeze switch and **End task** (with confirmation and an audit trail). |
 | **Persistent history** | Machine-wide snapshots plus the heaviest processes per tick are written to SQLite in WAL mode, with automatic retention pruning. |
 | **Watchdog agent** | A local agent evaluates rules on every sample (CPU, memory, disk, per-process load, memory leaks, processes starting or stopping), keeps alerts open until the condition clears, and notifies you with desktop popups and a sound. Runs inside the app or on its own with `--headless`. |
-| **Analytics** | Eight pre-built reports (top CPU, memory heavyweights, per-minute load, CPU spikes with culprits, memory growth, sessions, audit log, alert history) over a selectable time window. |
+| **Anomaly detection** | Rolling EWMA baselines with z-scores for CPU, memory, process count, network and disk I/O. The agent alerts on unusual deviations instead of fixed limits, and the baselines survive restarts. |
+| **Webhooks** | Alerts are forwarded as JSON incidents (`alert.fired` / `alert.resolved`) to any webhook or REST endpoint, with a stable `dedup_key`, retries and a delivery log in SQL. Works with Slack and Discord out of the box. |
+| **Analytics** | Ten pre-built reports (top CPU, memory heavyweights, per-minute load, CPU spikes with culprits, memory growth, sessions, audit log, alert history, learned baselines, webhook deliveries) over a selectable time window. |
 | **SQL console** | Syntax-highlighted editor, schema browser, example library, CSV export. The connection is opened **read-only**, and runaway queries are cancelled after 8 seconds. |
 | **Fast on Windows** | Process data comes from a single `NtQuerySystemInformation` call, the same source Task Manager uses, instead of opening every process one by one. |
 | **Restart friendly** | The dashboard charts are pre-filled from the database, so restarting the app does not leave you staring at empty graphs. |
@@ -116,6 +122,7 @@ The database is created on first run at `data/monitor.db`.
 ```text
 python main.py [--interval SECONDS] [--db PATH] [--retention HOURS] [--top N]
                [--no-agent] [--no-sound] [--headless [--run-for SECONDS]]
+               [--webhook URL ...] [--webhook-min-severity LEVEL]
 ```
 
 | Option | Default | Description |
@@ -128,6 +135,8 @@ python main.py [--interval SECONDS] [--db PATH] [--retention HOURS] [--top N]
 | `--no-sound` | off | Show alert popups silently. |
 | `--headless` | off | Run the collector and the agent in the console, without a window. |
 | `--run-for` | `0` | With `--headless`: exit after this many seconds (0 = until Ctrl+C). |
+| `--webhook` | none | Forward alerts to this URL. Repeat it for several endpoints. Also read from `SPM_WEBHOOKS` (comma separated). |
+| `--webhook-min-severity` | `warning` | Lowest severity sent to `--webhook` URLs: `info`, `warning` or `critical`. Also `SPM_WEBHOOK_MIN_SEVERITY`. |
 
 Example: sample every second and keep a full week of data.
 
@@ -137,9 +146,10 @@ python main.py --interval 1 --retention 168
 
 ## Watchdog agent
 
-The agent is a plain Python thread that lives on your machine. It does not call any network service,
+The agent is a plain Python thread that lives on your machine. It does not use any cloud service,
 API or language model: it reads the samples the collector produces, checks them against the rules in
-the `alert_rules` table and writes what it finds to the `alerts` table.
+the `alert_rules` table and writes what it finds to the `alerts` table. The only outgoing traffic is
+to the webhook URLs you configure yourself.
 
 <div align="center">
 <img src="docs/screenshots/rule-editor.png" alt="Rule editor" width="380">
@@ -171,8 +181,14 @@ An alert stays **open** while the condition is true and is **resolved** automati
 | `memory_growth_mb` | per process | A process that grew by 500 MB in 10 minutes |
 | `process_started` | watch | `Taskmgr.exe` was opened |
 | `process_stopped` | watch | No `explorer.exe` has been running for 5 s |
+| `anomaly_system_cpu` | baseline | CPU 4 standard deviations above its learned normal for 20 s |
+| `anomaly_system_memory` | baseline | Memory use jumped 4 sigma above normal |
+| `anomaly_process_count` | baseline | Sudden surge in the number of processes |
+| `anomaly_network` | baseline | Network traffic far above its usual level |
+| `anomaly_disk_io` | baseline | Disk reads and writes far above their usual level |
 
-Ten rules are seeded the first time a database is created (two of them disabled, as examples).
+Fifteen rules are seeded the first time a database is created: ten threshold rules and five anomaly rules
+(four of them disabled, as examples). Upgrading from 1.1 adds only the anomaly rules.
 Edit them on the **Alerts** page, or straight in SQL:
 
 ```sql
@@ -184,6 +200,93 @@ VALUES ('Chrome too hungry', 'process_memory_mb', 2048, 30, 600, 'warning', 'chr
 
 Changes made on the Alerts page apply immediately; changes made from outside apply the next time the app starts.
 
+### Anomaly detection
+
+Fixed limits either fire all the time on a machine that is always busy, or miss problems on a machine
+that is usually idle. The anomaly rules compare each value with what is **normal for this machine**:
+
+- For every series (CPU, memory, process count, network, disk I/O) the agent keeps an exponentially
+  weighted moving average and variance (EWMA) with a 30-minute half-life.
+- Each new value gets a z-score against the baseline *before* it is learned:
+  `z = (value - mean) / max(std, floor)`. The rule fires when `z >= threshold` for `duration_s`.
+- The first 60 samples (about two minutes) are a warm-up with no anomaly alerts. During warm-up the
+  baseline behaves like a plain running mean and variance.
+- A per-series floor on the standard deviation (for example 2 % for CPU, 1 % for memory) stops a very
+  flat series from turning tiny wobbles into huge z-scores.
+- Baselines are checkpointed to the `baselines` table every 30 samples and on shutdown, so a restart
+  continues from where it stopped. A baseline older than six hours is relearned.
+
+Because the baseline keeps moving, a slow shift (a machine that gets busier through the afternoon)
+becomes the new normal, while a sudden jump stands out. It does not model daily or weekly seasonality:
+the 9 am login rush is compared with the last half hour, not with yesterday at 9 am.
+
+See what the agent has learned with the *Learned baselines* report, or:
+
+```sql
+SELECT series, ROUND(mean, 1) AS normal, ROUND(std, 2) AS std, samples FROM baselines;
+```
+
+### Webhooks
+
+Every alert can be forwarded as an incident to a webhook or REST endpoint, for example a ticketing
+system, Slack, Discord, Teams through a workflow, n8n or your own API.
+
+```bash
+python main.py --webhook https://example.com/incidents --webhook-min-severity warning
+```
+
+Endpoints can also live in the database, each with its own minimum severity:
+
+```sql
+INSERT INTO webhook_endpoints (name, url, min_severity)
+VALUES ('ticketing', 'https://tickets.example.com/api/incidents', 'critical');
+```
+
+The agent already deduplicates: an incident is raised once, stays open while the condition persists, and
+a cooldown applies afterwards. The dispatcher sends exactly one `alert.fired` when an incident opens and
+one `alert.resolved` when it closes. One-shot events, such as a watched process starting, send only
+`alert.fired`. Every incident carries a stable `dedup_key` (`host:rule:pid`, or `host:rule:system` for
+machine-wide rules), so a ticketing system can merge repeats into one ticket.
+
+```json
+{
+  "source": "system-process-monitor",
+  "version": "1.2.0",
+  "event": "alert.fired",
+  "host": "build-server",
+  "incident": {
+    "id": "build-server-42",
+    "dedup_key": "build-server:5:4120",
+    "status": "open",
+    "severity": "warning",
+    "rule": "Runaway process",
+    "metric": "process_cpu",
+    "title": "Runaway process",
+    "message": "game.exe (PID 4120): process cpu at 63.0% (limit 50%) for 60s",
+    "value": 63.0,
+    "pid": 4120,
+    "process": "game.exe",
+    "opened_at": "2026-11-22T22:14:33+00:00",
+    "resolved_at": null
+  },
+  "text": "[WARNING] Runaway process on build-server: game.exe (PID 4120): ...",
+  "content": "[WARNING] Runaway process on build-server: game.exe (PID 4120): ..."
+}
+```
+
+`text` is what Slack and Mattermost display, and `content` is what Discord displays, so those work
+without an adapter.
+
+- Requests are `POST` with `Content-Type: application/json`. A 2xx response counts as delivered.
+- Network errors, `429` and `5xx` responses are retried three times with exponential backoff. Other `4xx`
+  responses are not retried.
+- Deliveries run on their own thread, so a slow endpoint never delays monitoring. When the agent stops,
+  the queue is drained first.
+- Every delivery is logged in `webhook_deliveries`; see the *Webhook deliveries* report. Only the
+  host name of the URL is stored, because webhook URLs often contain a secret token.
+- **Send test alert** on the Alerts page posts an `alert.test` event to every endpoint, regardless of
+  severity filters.
+
 ### Running only the agent
 
 ```bash
@@ -191,7 +294,7 @@ python main.py --headless
 ```
 
 ```text
-Watchdog agent running locally: 8 enabled rules, sampling every 2s.
+Watchdog agent running locally: 11 enabled rules, sampling every 2s.
 Database: data/monitor.db
 Press Ctrl+C to stop.
 
@@ -237,6 +340,7 @@ docker run -d --name spm-agent --pid=host -v spm-data:/data \
 | Health check | `python -m spm.healthcheck` reports unhealthy if no snapshot was written in the last 30 s. |
 | Stopping | `docker stop` sends SIGTERM; the agent finishes the current sample, closes open alerts and exits. |
 | Logs | Alerts are printed one per line, without colour codes, so `docker logs` stays readable. |
+| Webhooks | Set `SPM_WEBHOOKS` (comma separated URLs) and optionally `SPM_WEBHOOK_MIN_SEVERITY`, for example `SPM_WEBHOOKS=https://example.com/hook docker compose up -d`. |
 | Rules | Edit them with SQL: `docker exec -it spm-agent python -c "..."`, or copy the database out (below), edit it in the desktop app and copy it back. |
 
 Copy the database out to open it in the desktop app or any SQLite tool:
@@ -260,8 +364,9 @@ flowchart LR
         B --> C[(SQLite<br/>WAL mode)]
     end
     B -- every sample --> W[Watchdog agent<br/>thread]
-    W -- alerts --> C
+    W -- alerts, baselines --> C
     W -- new alerts --> D
+    W -- fired / resolved --> X[Webhook dispatcher<br/>thread] --> Y([Webhook / REST<br/>endpoints])
     B -- latest sample --> D[Tk main loop<br/>polls every 250 ms]
     D --> E[Overview]
     D --> F[Processes]
@@ -285,6 +390,7 @@ erDiagram
     sessions ||--o{ system_snapshots : records
     system_snapshots ||--o{ process_samples : contains
     alert_rules ||--o{ alerts : raises
+    alerts ||--o{ webhook_deliveries : forwarded
     sessions {
         INTEGER id PK
         REAL started_at
@@ -336,6 +442,31 @@ erDiagram
         REAL resolved_at
         INTEGER acknowledged
     }
+    baselines {
+        TEXT series PK
+        REAL mean
+        REAL var
+        REAL std
+        INTEGER samples
+        REAL updated_at
+    }
+    webhook_endpoints {
+        INTEGER id PK
+        TEXT name
+        TEXT url
+        TEXT min_severity
+        INTEGER enabled
+    }
+    webhook_deliveries {
+        INTEGER id PK
+        REAL ts
+        INTEGER alert_id FK
+        TEXT endpoint
+        TEXT event
+        INTEGER ok
+        INTEGER status_code
+        INTEGER attempts
+    }
     process_events {
         INTEGER id PK
         REAL ts
@@ -371,6 +502,8 @@ All reports live in [`sql/reports.sql`](sql/reports.sql) and are parsed at start
 | Recording sessions | `LEFT JOIN` aggregate over every run of the app |
 | Action audit log | Every **End task** attempt and its outcome |
 | Alert history | Conditional aggregates such as `SUM(resolved_at IS NULL)` and mean time to resolve per rule |
+| Learned baselines | The EWMA state per series, with the level a 4-sigma alert would need |
+| Webhook deliveries | Success rate, retries and last error per endpoint, using `CASE` inside `MAX` |
 
 Here is the spike report, which pairs every CPU spike with the process responsible for it:
 
@@ -432,7 +565,7 @@ SystemProcessMonitor/
 |-- docker-compose.yml
 |-- .dockerignore
 |-- pytest.ini
-|-- tests/                  pytest suite (database, reports, collector, agent, docker, helpers)
+|-- tests/                  pytest suite (database, reports, collector, agent, baselines, webhooks, docker)
 |-- sql/
 |   |-- schema.sql          Tables, indexes and views (idempotent)
 |   `-- reports.sql         Analytics reports with name/title/description headers
@@ -440,6 +573,8 @@ SystemProcessMonitor/
 |   |-- app.py              Main window, sidebar, page routing, polling loop
 |   |-- collector.py        Background sampler thread
 |   |-- agent.py            Local watchdog agent: rule engine and alert lifecycle
+|   |-- baseline.py         EWMA baselines and z-scores for anomaly detection
+|   |-- webhooks.py         Incident payloads, delivery with retries, dispatcher thread
 |   |-- notify.py           Desktop popups and alert sounds
 |   |-- headless.py         Console mode (--headless)
 |   |-- healthcheck.py      Health probe used by the Docker image
@@ -469,7 +604,9 @@ pytest
 | `tests/test_database.py` | Schema bootstrap, WAL mode, inserts, retention pruning, read-only enforcement, row limits, query timeout |
 | `tests/test_reports.py` | Every report runs on an empty database, and returns the expected answers on a known fixture |
 | `tests/test_collector.py` | Process enumeration, CPU accounting, the Windows fast path against psutil, the live collector thread |
-| `tests/test_agent.py` | Every rule type, durations, cooldowns, auto-resolve, rule reloads, default rule seeding, the agent thread end to end |
+| `tests/test_agent.py` | Every rule type including anomaly rules, durations, cooldowns, auto-resolve, rule reloads, baseline persistence, default rule seeding, the agent thread end to end |
+| `tests/test_baseline.py` | EWMA maths: warm-up, plain mean/variance equivalence, half-life, noise versus spikes, the std floor |
+| `tests/test_webhooks.py` | A real local HTTP server: payload shape, fired/resolved, deduplication, severity filter, retries, 4xx/5xx handling, secret-safe logging |
 | `tests/test_docker.py` | The headless path never imports Tk, the health check, `.dockerignore` and Dockerfile consistency, a full headless run |
 | `tests/test_theme.py` | Formatting helpers, colour blending, table sort order, the SQL tokenizer |
 
@@ -493,10 +630,19 @@ The tests use temporary databases and never touch `data/monitor.db`. No window i
 | `ModuleNotFoundError: customtkinter` or `psutil` | Run `pip install -r requirements.txt` with the same interpreter you use to start the app. |
 | **End task** says "access denied" | System and service processes need elevated rights. Start the terminal or `run.bat` as administrator. |
 | Text looks blurry on a high-DPI screen | Make sure you are using the regular `python.exe`, not a compatibility-mode shortcut. CustomTkinter enables per-monitor DPI awareness automatically. |
+| Anomaly alerts right after the first start | The first two minutes are a warm-up, after that the baseline still needs some history to settle. Raise the threshold (for example to 5) if a rule is noisy on your machine. |
+| Webhook not arriving | Check the *Webhook deliveries* report: it shows the HTTP status and error per endpoint. Use **Send test alert** to try it without waiting for a real alert. |
 | Too many popups | Raise the threshold or cooldown of the noisy rule on the **Alerts** page, switch on *Mute popups*, or start with `--no-sound`. |
 | "database is locked" | Two instances share one database file. Close one of them or start the second with `--db other.db`. |
 
 ## Changelog
+
+### 1.2.0
+- Anomaly detection: EWMA baselines with z-scores for CPU, memory, process count, network and disk I/O,
+  persisted in the new `baselines` table, plus five seeded anomaly rules.
+- Webhooks: JSON incidents (`alert.fired`, `alert.resolved`, `alert.test`) with a `dedup_key`, retries with
+  backoff, a delivery log (`webhook_deliveries`) and endpoints from the CLI, the environment or SQL.
+- New reports: *Learned baselines* and *Webhook deliveries*.
 
 ### 1.1.0
 - Local watchdog agent with ten metrics, open/resolved alert lifecycle and cooldowns.

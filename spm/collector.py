@@ -87,6 +87,7 @@ class Collector(threading.Thread):
         self._prev_cpu: dict[tuple[int, float], int] = {}
         self._prev_wall = 0.0
         self._total_mem = psutil.virtual_memory().total
+        self.listeners: list = []  # callables receiving every new Sample (e.g. the watchdog agent)
 
     @property
     def latest(self) -> Sample | None:
@@ -172,6 +173,11 @@ class Collector(threading.Thread):
 
             with self._lock:
                 self._latest = sample
+            for listener in self.listeners:
+                try:
+                    listener(sample)
+                except Exception:
+                    log.exception("sample listener failed")
 
             tick += 1
             if tick % 300 == 0:

@@ -1,0 +1,16 @@
+services:
+  agent:
+    build: .
+    image: system-process-monitor:1.1.0
+    container_name: spm-agent
+    # share the host PID namespace so the agent sees the host's processes,
+    # not just its own container
+    pid: host
+    restart: unless-stopped
+    command: ["--interval", "2", "--retention", "24"]
+    volumes:
+      - spm-data:/data
+    stop_grace_period: 10s
+
+volumes:
+  spm-data:

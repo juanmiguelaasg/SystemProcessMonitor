@@ -29,9 +29,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .baseline import SERIES, Ewma, new_baseline
 from .database import Database
 
 log = logging.getLogger(__name__)
+
+BASELINE_SAVE_EVERY = 30          # evaluations between baseline checkpoints
+BASELINE_STALE_S = 6 * 3600       # a stored baseline older than this is relearned
 
 SEVERITIES = ("info", "warning", "critical")
 
@@ -47,6 +51,12 @@ METRICS: dict[str, tuple[str, str, str]] = {
     "memory_growth_mb": ("Memory growth", "growth", " MB"),
     "process_started": ("Watched process started", "watch", ""),
     "process_stopped": ("Watched process stopped", "watch", ""),
+    # anomaly rules: threshold is a z-score against the learned baseline
+    "anomaly_system_cpu": ("CPU anomaly", "anomaly", " sigma"),
+    "anomaly_system_memory": ("Memory anomaly", "anomaly", " sigma"),
+    "anomaly_process_count": ("Process count anomaly", "anomaly", " sigma"),
+    "anomaly_network": ("Network anomaly", "anomaly", " sigma"),
+    "anomaly_disk_io": ("Disk I/O anomaly", "anomaly", " sigma"),
 }
 
 SYSTEM_VALUES: dict[str, Callable] = {
@@ -90,6 +100,9 @@ class Rule:
             return f"{label}{who}{extra}"
         if kind == "growth":
             return f"{label}{who} >= {self.threshold:g}{unit} in {self.duration_s:g}s"
+        if kind == "anomaly":
+            hold = f" for {self.duration_s:g}s" if self.duration_s else ""
+            return f"{label}: {self.threshold:g} sigma above baseline{hold}"
         hold = f" for {self.duration_s:g}s" if self.duration_s else ""
         return f"{label}{who} >= {self.threshold:g}{unit}{hold}"
 
@@ -138,6 +151,12 @@ class WatchdogAgent(threading.Thread):
         self._states: dict[tuple, _State] = {}
         self._watches: dict[int, _Watch] = {}
         self._mem_history: dict[int, deque] = {}
+        # learned baselines, one per series in baseline.SERIES
+        self.baselines: dict[str, Ewma] = {}
+        self._baselines_loaded = False
+        self._scores: dict[str, tuple[float, float, float, float | None]] = {}  # value, mean, std, z
+        # called as listener(event, alert_id) with event "fired" or "resolved" (webhooks)
+        self.listeners: list[Callable[[str, int], None]] = []
         self._reload = threading.Event()
         self._reload.set()
         self._stop_event = threading.Event()
@@ -179,6 +198,39 @@ class WatchdogAgent(threading.Thread):
         except Exception as exc:
             log.exception("watchdog agent crashed")
             self.error = exc
+        finally:
+            if self.db is not None and self._baselines_loaded:
+                try:
+                    self.save_baselines()
+                except Exception:
+                    log.exception("could not save baselines")
+
+    # -- baselines -------------------------------------------------------------
+    def load_baselines(self, now: float) -> None:
+        self._baselines_loaded = True
+        stored = self.db.load_baselines()
+        for series in SERIES:
+            baseline = new_baseline(series)
+            row = stored.get(series)
+            if row and now - row[3] <= BASELINE_STALE_S:
+                baseline.mean, baseline.var, baseline.samples, baseline.last_ts = row
+            self.baselines[series] = baseline
+
+    def save_baselines(self) -> None:
+        self.db.save_baselines([
+            (name, b.mean, b.var, b.std, b.samples, b.last_ts)
+            for name, b in self.baselines.items() if b.mean is not None
+        ])
+
+    def _learn(self, sample) -> None:
+        if not self._baselines_loaded:
+            self.load_baselines(sample.ts)
+        for series, spec in SERIES.items():
+            baseline = self.baselines[series]
+            value = float(spec.value(sample))
+            mean, std = baseline.mean, baseline.std
+            z = baseline.observe(value, sample.ts)
+            self._scores[series] = (value, mean if mean is not None else value, std, z)
 
     # -- evaluation ------------------------------------------------------------
     def evaluate(self, sample) -> list[Alert]:
@@ -189,11 +241,17 @@ class WatchdogAgent(threading.Thread):
             self._forget_removed_rules(sample.ts)
 
         now = sample.ts
+        self._learn(sample)
         fired: list[Alert] = []
         live: set[tuple] = set()
         for rule in self.rules:
             kind = METRICS.get(rule.metric, ("", "unknown", ""))[1]
-            if kind == "system":
+            if kind == "anomaly":
+                series = rule.metric[len("anomaly_"):]
+                z = self._scores.get(series, (0, 0, 0, None))[3]
+                self._check(rule, (rule.id, "system"), z is not None and z >= rule.threshold,
+                            z, now, rule.duration_s, fired)
+            elif kind == "system":
                 value = float(SYSTEM_VALUES[rule.metric](sample))
                 self._check(rule, (rule.id, "system"), value >= rule.threshold, value,
                             now, rule.duration_s, fired)
@@ -215,12 +273,14 @@ class WatchdogAgent(threading.Thread):
         for key in [k for k in self._states if isinstance(k[1], int) and k not in live]:
             state = self._states.pop(key)
             if state.alert_id is not None:
-                self.db.resolve_alert(state.alert_id, now)
+                self._resolve(state.alert_id, now)
         alive = {p.pid for p in sample.processes}
         for pid in [pid for pid in self._mem_history if pid not in alive]:
             del self._mem_history[pid]
 
         self.evaluated += 1
+        if self.evaluated % BASELINE_SAVE_EVERY == 0:
+            self.save_baselines()
         self.open_alerts = sum(1 for s in self._states.values() if s.alert_id is not None)
         return fired
 
@@ -230,7 +290,7 @@ class WatchdogAgent(threading.Thread):
         if not condition:
             state.since = None
             if state.alert_id is not None:
-                self.db.resolve_alert(state.alert_id, now)
+                self._resolve(state.alert_id, now)
                 state.alert_id = None
             return
         if state.since is None:
@@ -295,6 +355,14 @@ class WatchdogAgent(threading.Thread):
             message = f"No process matching {rule.target} is running"
         elif kind == "growth":
             message = f"{who} grew by {value:.0f} MB in {rule.duration_s:g}s (limit {rule.threshold:g} MB)"
+        elif kind == "anomaly":
+            series = rule.metric[len("anomaly_"):]
+            spec = SERIES[series]
+            current, mean, std, _z = self._scores[series]
+            message = (f"{spec.label} at {current:.1f}{spec.unit} is {value:.1f} sigma above its "
+                       f"baseline of {mean:.1f}{spec.unit} (std {std:.1f})")
+            if held >= 1:
+                message += f" for {held:.0f}s"
         else:
             subject = f"{who}: {label.lower()}" if who else label
             message = f"{subject} at {value:.1f}{unit} (limit {rule.threshold:g}{unit})"
@@ -309,13 +377,25 @@ class WatchdogAgent(threading.Thread):
                       process.name if process is not None else None)
         self.outbox.put(alert)
         log.info("ALERT [%s] %s: %s", rule.severity, rule.name, message)
+        self._notify("fired", alert_id)
         return alert
+
+    def _resolve(self, alert_id: int, now: float) -> None:
+        self.db.resolve_alert(alert_id, now)
+        self._notify("resolved", alert_id)
+
+    def _notify(self, event: str, alert_id: int) -> None:
+        for listener in self.listeners:
+            try:
+                listener(event, alert_id)
+            except Exception:
+                log.exception("alert listener failed")
 
     def _forget_removed_rules(self, now: float) -> None:
         active = {r.id for r in self.rules}
         for key in [k for k in self._states if k[0] not in active]:
             state = self._states.pop(key)
             if state.alert_id is not None:
-                self.db.resolve_alert(state.alert_id, now)
+                self._resolve(state.alert_id, now)
         for rule_id in [r for r in self._watches if r not in active]:
             del self._watches[rule_id]

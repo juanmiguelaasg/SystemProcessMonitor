@@ -200,3 +200,91 @@ def test_agent_thread_end_to_end(db):
 def test_rule_describe():
     r = Rule(1, "x", "process_cpu", 50, 60, 0, "warning", "chrome.exe")
     assert r.describe() == "Process CPU [chrome.exe] >= 50% for 60s"
+
+
+# -- anomaly detection --------------------------------------------------------
+
+def warm_up(agent, n=80, cpu=15.0, jitter=3.0, start=0):
+    for i in range(n):
+        tick(agent, start + i * 2, cpu=cpu + (jitter if i % 2 else -jitter))
+    return start + n * 2
+
+
+def test_anomaly_fires_on_spike_after_warmup(agent):
+    add_rule(agent, name="odd cpu", metric="anomaly_system_cpu", threshold=4)
+    t = warm_up(agent)
+    assert tick(agent, t, cpu=17) == []          # normal wobble
+    fired = tick(agent, t + 2, cpu=70)
+    assert len(fired) == 1
+    assert "sigma above its baseline" in fired[0].message
+    assert fired[0].value > 4
+
+
+def test_anomaly_quiet_during_warmup(agent):
+    add_rule(agent, metric="anomaly_system_cpu", threshold=3)
+    tick(agent, 0, cpu=5)
+    assert tick(agent, 2, cpu=95) == []
+
+
+def test_anomaly_ignores_normal_noise(agent):
+    import random
+
+    rng = random.Random(1)
+    add_rule(agent, metric="anomaly_system_cpu", threshold=5)
+    fired = []
+    for i in range(600):
+        fired += tick(agent, i * 2, cpu=max(0, 20 + rng.gauss(0, 4)))
+    assert fired == []
+
+
+def test_anomaly_respects_hold_and_resolves(agent):
+    add_rule(agent, name="odd", metric="anomaly_system_cpu", threshold=4, duration=6)
+    t = warm_up(agent)
+    assert tick(agent, t, cpu=80) == []
+    assert tick(agent, t + 2, cpu=80) == []
+    assert len(tick(agent, t + 6, cpu=80)) == 1
+    tick(agent, t + 8, cpu=15)
+    assert open_alerts(agent.db) == []
+
+
+def test_baseline_survives_restart(db):
+    with db.conn:
+        db.conn.execute("DELETE FROM alert_rules")
+    first = WatchdogAgent(db=db)
+    for i in range(80):
+        first.evaluate(make_sample(ts=T0 + i * 2, cpu=30.0))
+    first.save_baselines()
+
+    second = WatchdogAgent(db=db)
+    second.evaluate(make_sample(ts=T0 + 200, cpu=30.0))
+    cpu = second.baselines["system_cpu"]
+    assert cpu.ready
+    assert cpu.mean == pytest.approx(30.0, abs=0.5)
+
+
+def test_stale_baseline_is_relearned(db):
+    with db.conn:
+        db.conn.execute("DELETE FROM alert_rules")
+    db.save_baselines([("system_cpu", 50.0, 4.0, 2.0, 500, T0 - 7 * 3600)])
+    agent = WatchdogAgent(db=db)
+    agent.evaluate(make_sample(ts=T0, cpu=10.0))
+    assert agent.baselines["system_cpu"].samples == 1
+
+
+def test_listeners_get_fired_and_resolved(agent):
+    events = []
+    agent.listeners.append(lambda event, alert_id: events.append(event))
+    add_rule(agent, threshold=90)
+    tick(agent, 0, cpu=95)
+    tick(agent, 2, cpu=10)
+    assert events == ["fired", "resolved"]
+
+
+def test_anomaly_rules_seeded(db):
+    metrics = {r[2] for r in db.load_rules()}
+    assert {"anomaly_system_cpu", "anomaly_system_memory", "anomaly_process_count"} <= metrics
+
+
+def test_anomaly_describe():
+    r = Rule(1, "x", "anomaly_network", 5, 10, 0, "info", None)
+    assert r.describe() == "Network anomaly: 5 sigma above baseline for 10s"
